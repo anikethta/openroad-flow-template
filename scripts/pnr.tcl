@@ -4,7 +4,7 @@
 #   openroad scripts/pnr.tcl
 #
 # For bring-up, set flow_stop_after to one of:
-#   link, floorplan, place, cts, route, finish
+#   link, rtlmp, floorplan, place, cts, route, finish
 
 # -----------------------------------------------------------------------------
 # User config
@@ -17,6 +17,8 @@ set top_module         "top"
 set netlist            [file join $project_dir build synth top_synth.v]
 set sdc_file           [file join $project_dir src constraints.sdc]
 set out_dir            [file join $project_dir build pnr]
+set sram_dir           [file join $project_dir build sram]
+set rtlmp_tcl          [file join $script_dir rtlmp.tcl]
 
 # Innovus-style aliases for the same core setup knobs.
 set design_toplevel    $top_module
@@ -49,18 +51,49 @@ set liberty_files      [list \
   [file join $sky130_hd timing sky130_fd_sc_hd__tt_025C_1v80.lib] \
 ]
 
-# Optional macro inputs. Use macro placement DEF before tapcell/PDN when needed.
-set macro_lefs         [list]
+# Optional macro inputs. Generated OpenRAM SRAM collateral is discovered from
+# build/sram by default. Override these lists if you want to use different
+# macro views or corners.
+set macro_lefs         [lsort [glob -nocomplain [file join $sram_dir "*.lef"]]]
+set macro_liberties    [lsort [glob -nocomplain [file join $sram_dir "*_TT_1p8V_25C.lib"]]]
 set floorplan_def      ""
-set macro_placements   [list]
-# Example macro placement entry:
-# lappend macro_placements [dict create \
-#   name "u_sram" origin {40.0 120.0} orientation R0 status FIRM]
+
+# Hard macro placement entries. The default matches the SRAM test instance in
+# build/synth/top_synth.v. Origin is in microns and is the macro lower-left.
+set sram_macro_inst    "fifo_inst/sram_storage/u_macro"
+set sram_macro_origin  {60.0 80.0}
+set sram_macro_orient  R0
+set sram_macro_status  FIRM
+set macro_placements   [list \
+  [dict create \
+    name $sram_macro_inst \
+    origin $sram_macro_origin \
+    orientation $sram_macro_orient \
+    status $sram_macro_status] \
+]
+
+# RTL macro placer. This is for RTLMP-guided clustering/planning of the
+# standard-cell netlist, not for black-box hard macro integration.
+set run_rtlmp          0
+set rtlmp_keep_data    1
+set rtlmp_target_util  0.25
+set rtlmp_max_num_level 2
+set rtlmp_fence        {380 80 640 300}
+
+# Standard-cell placement regions. These are stronger than RTLMP guidance:
+# matching instances are assigned to an OpenDB region/group that global
+# placement honors as a placement fence.
+set placement_regions  [list \
+  [dict create \
+    name storage_region \
+    area {380 80 640 300} \
+    inst_patterns {fifo_inst/storage_inst/*}] \
+]
 
 # Floorplan.
 set site_name          "unithd"
-set die_area           {0 0 300 300}
-set core_area          {20 20 280 280}
+set die_area           {0 0 700 500}
+set core_area          {40 40 660 460}
 
 # Routing.
 set signal_layers      "met1-met5"
@@ -69,8 +102,8 @@ set route_layer        "met3"
 set pin_hor_layers     "met3"
 set pin_ver_layers     "met2"
 set pin_constraints    [list \
-  [dict create region "left:*"  pins {din* rst wr_en rd_en flush}] \
-  [dict create region "right:*" pins {dout* full empty}] \
+  [dict create region "left:*"  pins {din* rst wr_en rd_en}] \
+  [dict create region "right:*" pins {dout* sram_test_dout* full empty}] \
   [dict create region "top:*"   pins {clk}] \
 ]
 
@@ -117,8 +150,36 @@ set pdn_inline_script  {
 set run_extraction     0
 set rcx_rules_file     ""
 
-# Bring-up control: link, floorplan, place, cts, route, finish.
+# Bring-up control: link, rtlmp, floorplan, place, cts, route, finish.
 set flow_stop_after    "finish"
+
+# Optional command-line overrides, for example:
+#   FLOW_STOP_AFTER=place RUN_RTLMP=0 openroad scripts/pnr.tcl
+if {[info exists ::env(FLOW_STOP_AFTER)] && $::env(FLOW_STOP_AFTER) ne ""} {
+  set flow_stop_after $::env(FLOW_STOP_AFTER)
+}
+if {[info exists ::env(RUN_RTLMP)] && $::env(RUN_RTLMP) ne ""} {
+  set run_rtlmp $::env(RUN_RTLMP)
+}
+if {[info exists ::env(SRAM_MACRO_INST)] && $::env(SRAM_MACRO_INST) ne ""} {
+  set sram_macro_inst $::env(SRAM_MACRO_INST)
+}
+if {[info exists ::env(SRAM_MACRO_ORIGIN)] && $::env(SRAM_MACRO_ORIGIN) ne ""} {
+  set sram_macro_origin $::env(SRAM_MACRO_ORIGIN)
+}
+if {[info exists ::env(SRAM_MACRO_ORIENT)] && $::env(SRAM_MACRO_ORIENT) ne ""} {
+  set sram_macro_orient $::env(SRAM_MACRO_ORIENT)
+}
+if {[info exists ::env(SRAM_MACRO_STATUS)] && $::env(SRAM_MACRO_STATUS) ne ""} {
+  set sram_macro_status $::env(SRAM_MACRO_STATUS)
+}
+set macro_placements [list \
+  [dict create \
+    name $sram_macro_inst \
+    origin $sram_macro_origin \
+    orientation $sram_macro_orient \
+    status $sram_macro_status] \
+]
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -142,6 +203,28 @@ proc require_optional_file {path label} {
   if {$path ne ""} {
     require_file $path $label
   }
+}
+
+proc normalize_lef_dbu {input_lef output_lef dbu_per_micron} {
+  set in_fp [open $input_lef r]
+  set out_fp [open $output_lef w]
+  while {[gets $in_fp line] >= 0} {
+    regsub {DATABASE[ \t]+MICRONS[ \t]+[0-9]+[ \t]*;} $line "DATABASE MICRONS $dbu_per_micron ;" line
+    puts $out_fp $line
+  }
+  close $in_fp
+  close $out_fp
+}
+
+proc normalize_macro_lefs {macro_lefs dbu_per_micron output_dir} {
+  file mkdir $output_dir
+  set normalized_lefs [list]
+  foreach lef $macro_lefs {
+    set normalized_lef [file join $output_dir [file tail $lef]]
+    normalize_lef_dbu $lef $normalized_lef $dbu_per_micron
+    lappend normalized_lefs $normalized_lef
+  }
+  return $normalized_lefs
 }
 
 proc stop_after {stage} {
@@ -185,10 +268,12 @@ proc connect_global_nets {} {
   add_global_connection -defer_connection -net $power_net -inst_pattern {.*} -pin_pattern {^VDDCE$}
   add_global_connection -defer_connection -net $power_net -inst_pattern {.*} -pin_pattern {^VPWR$}
   add_global_connection -defer_connection -net $power_net -inst_pattern {.*} -pin_pattern {^VPB$}
+  add_global_connection -defer_connection -net $power_net -inst_pattern {.*} -pin_pattern {^vccd1$}
   add_global_connection -defer_connection -net $ground_net -inst_pattern {.*} -pin_pattern {^VSS$} -ground
   add_global_connection -defer_connection -net $ground_net -inst_pattern {.*} -pin_pattern {^VSSE$}
   add_global_connection -defer_connection -net $ground_net -inst_pattern {.*} -pin_pattern {^VGND$}
   add_global_connection -defer_connection -net $ground_net -inst_pattern {.*} -pin_pattern {^VNB$}
+  add_global_connection -defer_connection -net $ground_net -inst_pattern {.*} -pin_pattern {^vssd1$}
   global_connect
   set_voltage_domain -name $voltage_domain -power $power_net -ground $ground_net
 }
@@ -215,6 +300,77 @@ proc place_macros {} {
     set orientation [dict_get_default $macro orientation R0]
     set status [dict_get_default $macro status FIRM]
     place_inst -name $name -origin $origin -orientation $orientation -status $status
+  }
+}
+
+proc create_placement_regions {} {
+  global placement_regions
+
+  if {[llength $placement_regions] == 0} {
+    return
+  }
+
+  set block [ord::get_db_block]
+  foreach region_cfg $placement_regions {
+    set name [dict get $region_cfg name]
+    set area [dict get $region_cfg area]
+    set patterns [dict get $region_cfg inst_patterns]
+
+    if {[llength $area] != 4} {
+      error "Placement region $name area must be {lx ly ux uy}; got: $area"
+    }
+
+    lassign $area lx ly ux uy
+    set group "NULL"
+    set region "NULL"
+    foreach existing_group [$block getGroups] {
+      if {[$existing_group getName] eq $name} {
+        set group $existing_group
+        set region [$group getRegion]
+        break
+      }
+    }
+
+    if {$group == "NULL"} {
+      set region [odb::dbRegion_create $block $name]
+      if {$region == "NULL"} {
+        error "Duplicate placement region name: $name"
+      }
+
+      odb::dbBox_create $region \
+        [ord::microns_to_dbu $lx] \
+        [ord::microns_to_dbu $ly] \
+        [ord::microns_to_dbu $ux] \
+        [ord::microns_to_dbu $uy]
+
+      set group [odb::dbGroup_create $region $name]
+      if {$group == "NULL"} {
+        error "Duplicate placement group name: $name"
+      }
+    } elseif {$region == "NULL"} {
+      error "Placement group $name already exists but has no region"
+    }
+
+    set matched 0
+    set added 0
+    foreach inst [$block getInsts] {
+      set inst_name [$inst getName]
+      foreach pattern $patterns {
+        if {[string match $pattern $inst_name]} {
+          if {[$inst getGroup] != $group} {
+            $group addInst $inst
+            incr added
+          }
+          incr matched
+          break
+        }
+      }
+    }
+
+    if {$matched == 0} {
+      error "Placement region $name matched no instances using patterns: $patterns"
+    }
+    puts "Placement region $name: matched $matched instances, added $added to {$area}"
   }
 }
 
@@ -246,23 +402,34 @@ file mkdir $out_dir
 set report_dir [file join $out_dir reports]
 file mkdir $report_dir
 
+if {$run_rtlmp} {
+  require_file $rtlmp_tcl "RTLMP Tcl"
+  source $rtlmp_tcl
+}
 require_file $netlist "Synthesized netlist"
 require_file $sdc_file "SDC file"
 require_file $tech_lef "Technology LEF"
 require_files $cell_lefs "Cell LEF"
 require_files $liberty_files "Liberty"
-foreach lef $macro_lefs {
-  require_file $lef "Macro LEF"
+if {[llength $macro_placements] > 0} {
+  require_files $macro_lefs "Macro LEF"
+  require_files $macro_liberties "Macro Liberty"
 }
 require_optional_file $pdn_tcl "PDN Tcl"
 if {$run_extraction} {
   require_file $rcx_rules_file "RCX rules file"
+}
+if {[llength $macro_lefs] > 0} {
+  set macro_lefs [normalize_macro_lefs $macro_lefs 1000 [file join $out_dir macro_lefs]]
 }
 
 # -----------------------------------------------------------------------------
 # Read design
 # -----------------------------------------------------------------------------
 foreach lib $liberty_files {
+  read_liberty $lib
+}
+foreach lib $macro_liberties {
   read_liberty $lib
 }
 
@@ -295,6 +462,12 @@ if {$floorplan_def ne ""} {
 }
 place_macros
 
+if {$run_rtlmp} {
+  run_rtlmp
+}
+create_placement_regions
+stop_after rtlmp
+
 set_routing_layers -signal $signal_layers -clock $clock_layers
 set_wire_rc -signal -layer $route_layer
 set_wire_rc -clock -layer $route_layer
@@ -316,6 +489,7 @@ stop_after floorplan
 # -----------------------------------------------------------------------------
 global_placement -routability_driven -density 0.65
 repair_design
+create_placement_regions
 detailed_placement
 check_placement -verbose
 

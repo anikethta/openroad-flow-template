@@ -1,3 +1,9 @@
 build
 reports
+.venv/
 *.log
+sram/__pycache__
+temp/
+
+# sram-script generated memory files
+src/rtl/util/*_stub.v

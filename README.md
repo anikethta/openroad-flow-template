@@ -1,6 +1,6 @@
-# OpenROAD Flow Template
+# OpenROAD Flow Template [^1]
 
-This repository is a small, standalone RTL-to-layout template using:
+This repository is a small, standalone RTL-to-GDSII template using:
 
 - Yosys for RTL synthesis
 - OpenROAD for place-and-route
@@ -16,13 +16,19 @@ into `build/pnr`.
 .
 ├── scripts/
 │   ├── synth.tcl          # Yosys synthesis flow
-│   └── pnr.tcl            # OpenROAD place-and-route flow
+│   ├── pnr.tcl            # OpenROAD place-and-route flow
+│   └── rtlmp.tcl          # Optional RTLMP helper proc
+├── sram/
+│   ├── config/            # OpenRAM SRAM config files
+│   └── sram_compiler.py   # Batch SRAM generation wrapper
 ├── src/
 │   ├── constraints.sdc    # Timing constraints for synthesis/PnR
 │   └── rtl/
 │       ├── top.sv         # Default top-level RTL
-│       └── fifo.sv        # Example design logic
+│       ├── fifo.sv        # Example design logic
+│       └── util/          # Generated SRAM blackbox/wrapper stubs
 └── build/                 # Generated outputs, usually gitignored
+    ├── sram/              # OpenRAM-generated SRAM collateral
     ├── synth/
     │   ├── top_synth.v
     │   ├── top.json
@@ -51,6 +57,67 @@ The scripts assume the SkyWater PDK is available here:
 For a different install location, update `pdk_root` in `scripts/pnr.tcl`, or set
 `PDK_ROOT` for synthesis.
 
+OpenRAM's Sky130 technology setup is stricter than the PnR scripts: it expects
+an `open_pdks` install containing `sky130A`, such as:
+
+```text
+$PDK_ROOT/sky130A/libs.tech/magic/sky130A.magicrc
+$PDK_ROOT/sky130A/libs.tech/ngspice/sky130.lib.spice
+```
+
+Use the OpenRAM source environment rather than an unrelated pip package:
+
+```sh
+export OPENRAM_HOME=$HOME/OpenRAM/compiler
+export OPENRAM_TECH=$HOME/OpenRAM/technology
+export PYTHONPATH=$HOME/OpenRAM
+export PDK_ROOT=$HOME/pdks/share/pdk   # directory that directly contains sky130A
+```
+
+If `sky130A` is directly under `~/pdks`, use `export PDK_ROOT=$HOME/pdks`.
+
+## SRAM Generation
+
+SRAMs are generated with OpenRAM using config files in:
+
+```text
+sram/config/
+```
+
+Run the SRAM compiler wrapper from the project root:
+
+```sh
+python3 sram/sram_compiler.py
+```
+
+With no config argument, the wrapper loops through every `*.py` file in
+`sram/config`. You can also generate one config or a different config directory:
+
+```sh
+python3 sram/sram_compiler.py sram/config/example_config.py
+python3 sram/sram_compiler.py path/to/configs
+```
+
+The wrapper clears `build/sram/` once before a top-level run, then writes all
+generated SRAM collateral there:
+
+```text
+build/sram/sram_256x8.lef
+build/sram/sram_256x8.gds
+build/sram/sram_256x8.v
+build/sram/sram_256x8_TT_1p8V_25C.lib
+```
+
+It also writes a synthesis-facing blackbox/wrapper stub into:
+
+```text
+src/rtl/util/sram_256x8_stub.v
+```
+
+The generated OpenRAM Verilog model is for simulation/collateral. Synthesis uses
+the stub: the wrapper exposes logical-width ports, ties off spare/extra bits,
+and instantiates the real blackbox macro cell, for example `sram_256x8`.
+
 ## Synthesis
 
 Run Yosys from the project root:
@@ -61,11 +128,12 @@ yosys -c scripts/synth.tcl
 
 The synthesis script:
 
-- reads SystemVerilog/Verilog from `src/rtl`
+- reads SystemVerilog/Verilog from `src/rtl` and one-level utility subdirs
 - uses `top` as the default top module
 - maps logic to SKY130 HD using the nominal liberty file
+- maps raw constants to `sky130_fd_sc_hd__conb_1` tie cells
 - writes a synthesized Verilog netlist and JSON netlist
-- writes area, timing, and stat reports
+- writes stat, stdcell area, macro area, and timing reports
 
 Default synthesis outputs:
 
@@ -75,6 +143,8 @@ build/synth/top.json
 build/synth/reports/rtl_stat.rpt
 build/synth/reports/synth_stat.rpt
 build/synth/reports/area.rpt
+build/synth/reports/stdcell_area.rpt
+build/synth/reports/macro_area.rpt
 build/synth/reports/timing.rpt
 ```
 
@@ -84,10 +154,24 @@ Useful overrides:
 TOP=my_top yosys -c scripts/synth.tcl
 CLOCK_PERIOD_PS=10000 yosys -c scripts/synth.tcl
 LIBERTY=/path/to/corner.lib yosys -c scripts/synth.tcl
+SYNTH_FLATTEN=1 yosys -c scripts/synth.tcl
+SRAM_LIBERTY=build/sram/sram_256x8_TT_1p8V_25C.lib yosys -c scripts/synth.tcl
 ```
 
 `CLOCK_PERIOD_PS` is passed to ABC in picoseconds. For example, `5000` means a
 5 ns clock target.
+
+Hierarchy is preserved by default so OpenROAD RTLMP has useful module boundaries
+to cluster. Set `SYNTH_FLATTEN=1` when you want the older flat netlist style.
+
+Macro Liberty files are not used for ABC standard-cell mapping. They are used to
+produce `macro_area.rpt`, which counts macro instances in `top_synth.v` and
+multiplies by the macro area from Liberty. Use this alongside
+`stdcell_area.rpt`.
+
+If a macro blackbox disappears from `top_synth.v`, make sure at least one macro
+output is observable or functionally used. The example design exposes
+`sram_test_dout[7:0]` at top level so the SRAM test macro is retained.
 
 ## Timing Constraints
 
@@ -121,6 +205,8 @@ The PnR script reads:
 build/synth/top_synth.v
 src/constraints.sdc
 ~/pdks/skywater-pdk/libraries/sky130_fd_sc_hd/latest
+build/sram/*.lef
+build/sram/*_TT_1p8V_25C.lib
 ```
 
 Default final outputs:
@@ -145,6 +231,7 @@ Supported stages:
 
 ```text
 link
+rtlmp
 floorplan
 place
 cts
@@ -155,11 +242,12 @@ finish
 Recommended bring-up order for a new design:
 
 1. `link`: confirm Liberty, LEF, netlist, and SDC load correctly.
-2. `floorplan`: confirm die/core area, rows, tracks, tapcells, PDN, and pins.
-3. `place`: confirm global/detailed placement succeeds.
-4. `cts`: confirm clock tree synthesis and timing repair.
-5. `route`: confirm global/detailed route and antenna repair.
-6. `finish`: write final DEF/ODB/netlist/SDC and reports.
+2. `rtlmp`: inspect RTLMP clustering/checkpoints before tapcell and PDN.
+3. `floorplan`: confirm die/core area, rows, tracks, tapcells, PDN, and pins.
+4. `place`: confirm global/detailed placement succeeds.
+5. `cts`: confirm clock tree synthesis and timing repair.
+6. `route`: confirm global/detailed route and antenna repair.
+7. `finish`: write final DEF/ODB/netlist/SDC and reports.
 
 ## Things to Tweak in the PnR Script
 
@@ -178,8 +266,51 @@ Floorplan:
 
 ```tcl
 set site_name "unithd"
-set die_area  {0 0 300 300}
-set core_area {20 20 280 280}
+set die_area  {0 0 700 500}
+set core_area {40 40 660 460}
+```
+
+RTLMP:
+
+```tcl
+set run_rtlmp            0
+set rtlmp_keep_data      1
+set rtlmp_target_util    0.25
+set rtlmp_max_num_level  2
+set rtlmp_fence          {380 80 640 300}
+```
+
+RTLMP is for hierarchy-guided standard-cell clustering and physical planning. It
+does not create a black-box macro, and it does not require a separate macro
+Liberty/LEF/GDS view. The `run_rtlmp` toggle remains in `scripts/pnr.tcl`, while
+the `run_rtlmp` proc itself lives in `scripts/rtlmp.tcl`.
+
+`rtlmp_fence` is ignored when `run_rtlmp` is `0`. Placement regions are separate
+and still apply unless you clear them:
+
+```tcl
+set placement_regions [list]
+```
+
+SRAM macro placement:
+
+```tcl
+set sram_macro_inst    "fifo_inst/sram_storage/u_macro"
+set sram_macro_origin  {60.0 80.0}
+set sram_macro_orient  R0
+set sram_macro_status  FIRM
+```
+
+Override the macro location from the shell:
+
+```sh
+SRAM_MACRO_ORIGIN="{80 120}" openroad scripts/pnr.tcl
+```
+
+The default macro instance is the hard SRAM inside the generated wrapper:
+
+```text
+fifo_inst/sram_storage/u_macro
 ```
 
 Routing and pins:
@@ -196,8 +327,8 @@ Pin placement groups:
 
 ```tcl
 set pin_constraints [list \
-  [dict create region "left:*"  pins {din* rst wr_en rd_en flush}] \
-  [dict create region "right:*" pins {dout* full empty}] \
+  [dict create region "left:*"  pins {din* rst wr_en rd_en}] \
+  [dict create region "right:*" pins {dout* sram_test_dout* full empty}] \
   [dict create region "top:*"   pins {clk}] \
 ]
 ```
@@ -226,23 +357,76 @@ The inline PDN is a minimal SKY130 HD-style grid:
 For serious tapeout-oriented work, replace or validate this PDN against a known
 platform configuration.
 
-## Macro Support
+## SRAM Macro Integration
 
-The PnR script has hooks for macro LEFs and fixed/firm macro placement:
+The example flow integrates an OpenRAM SRAM as a hard macro.
 
-```tcl
-set macro_lefs [list /path/to/macro.lef]
-lappend macro_placements [dict create \
-  name "u_macro" origin {40.0 120.0} orientation R0 status FIRM]
+Synthesis sees the generated stub in `src/rtl/util`, but PnR uses the real macro
+views:
+
+```text
+build/sram/sram_256x8.lef
+build/sram/sram_256x8_TT_1p8V_25C.lib
 ```
 
-If you already have a floorplan DEF with macro placement, set:
+`scripts/pnr.tcl` auto-discovers those views:
 
 ```tcl
-set floorplan_def "/path/to/floorplan.def"
+set macro_lefs      [lsort [glob -nocomplain [file join $sram_dir "*.lef"]]]
+set macro_liberties [lsort [glob -nocomplain [file join $sram_dir "*_TT_1p8V_25C.lib"]]]
 ```
 
-Macros should be placed before tapcell and PDN generation.
+OpenRAM emits macro LEFs with `DATABASE MICRONS 2000`, while the SKY130 HD tech
+LEF uses `DATABASE MICRONS 1000`. The PnR script leaves the original OpenRAM LEF
+untouched, copies it into `build/pnr/macro_lefs/`, rewrites the DBU header to
+1000, and reads that normalized copy.
+
+The default SRAM macro is fixed before tapcell/PDN:
+
+```def
+fifo_inst/sram_storage/u_macro sram_256x8
+```
+
+To verify placement after PnR:
+
+```sh
+rg "fifo_inst/sram_storage/u_macro|sram_256x8" build/pnr/top.routed.def
+rg "sram_256x8" build/pnr/top.routed.v
+```
+
+Expected DEF shape:
+
+```def
+- fifo_inst/sram_storage/u_macro sram_256x8 + FIXED ( 60000 80000 ) N ;
+```
+
+The coordinates are DBU. With `UNITS DISTANCE MICRONS 1000`, this means:
+
+```text
+x = 60 um
+y = 80 um
+```
+
+The generated `sram_256x8.lef` macro is about `298.035um x 188.73um`, so the
+default floorplan is larger than the earlier tiny example floorplan.
+
+Important: the OpenROAD GUI/DEF view shows the SRAM as a LEF abstract block. It
+does not show the SRAM's internal bitcell layout. To view SRAM internals, open
+the SRAM GDS directly in KLayout:
+
+```sh
+/Applications/KLayout/klayout.app/Contents/MacOS/klayout build/sram/sram_256x8.gds
+```
+
+If `klayout` is not on your shell `PATH`, use the full app path above or:
+
+```sh
+open -a KLayout build/sram/sram_256x8.gds
+```
+
+This OpenROAD build does not provide `write_gds`, so full-chip GDS streaming is
+left to KLayout/Magic-based DEF-to-GDS tooling. The current template focuses on
+DEF/ODB/routed-Verilog PnR outputs plus direct SRAM GDS inspection.
 
 ## Reports
 
@@ -288,15 +472,45 @@ SDC command errors
 OpenROAD uses OpenSTA, so not every commercial SDC/Tcl helper is available. Keep
 constraints simple and prefer direct `get_ports`/`get_clocks` expressions.
 
+`Unable to find open_pdks tech file. Set PDK_ROOT.`
+
+OpenRAM's Sky130 tech plugin needs an `open_pdks` install with `sky130A`, not
+just the raw `skywater-pdk` tree used by PnR. Set `PDK_ROOT` to the directory
+that directly contains `sky130A`.
+
+`LEF UNITS DATABASE MICRON convert factor ... is greater than the database units`
+
+OpenRAM SRAM LEFs may use `DATABASE MICRONS 2000`, while the SKY130 tech LEF
+uses 1000. `scripts/pnr.tcl` normalizes macro LEFs into
+`build/pnr/macro_lefs/` before `read_lef`.
+
+`Net ... of signal type GROUND is not routable by TritonRoute`
+
+Raw constants feeding macro pins can become special ground/power-typed nets.
+The synthesis flow runs `hilomap` to map constants to
+`sky130_fd_sc_hd__conb_1` tie cells. Rerun synthesis before rerunning PnR after
+changing this behavior.
+
+SRAM is hard to see in OpenROAD GUI
+
+The OpenROAD GUI shows the SRAM LEF abstract, not the internal GDS geometry.
+Check `top.routed.def` for the fixed macro component and use KLayout to inspect
+`build/sram/sram_256x8.gds` if you want to see the actual SRAM layout.
+
 ## Adapting This Template
 
 For a new project:
 
 1. Put RTL in `src/rtl`.
-2. Update `top_module` in both scripts, or run synthesis with `TOP=...`.
-3. Update `src/constraints.sdc`.
-4. Run synthesis and inspect `build/synth/reports`.
-5. Update PnR floorplan dimensions and pin constraints.
-6. Bring up OpenROAD stage by stage using `flow_stop_after`.
-7. Once each stage is clean, set `flow_stop_after` to `finish`.
+2. Add OpenRAM SRAM configs under `sram/config` if the design uses hard SRAMs.
+3. Run `python3 sram/sram_compiler.py` to generate `build/sram` collateral and
+   RTL stubs.
+4. Update `top_module` in both scripts, or run synthesis with `TOP=...`.
+5. Update `src/constraints.sdc`.
+6. Run synthesis and inspect `build/synth/reports`.
+7. Update PnR floorplan dimensions, macro placement, placement regions, and pin
+   constraints.
+8. Bring up OpenROAD stage by stage using `flow_stop_after`.
+9. Once each stage is clean, set `flow_stop_after` to `finish`.
 
+[^1]: this readme is mad agentic icl
